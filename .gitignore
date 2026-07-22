@@ -1,0 +1,14 @@
+# Credentials — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store

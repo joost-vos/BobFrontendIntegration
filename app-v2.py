@@ -1,0 +1,686 @@
+"""
+Newsletter Companion v2 — Backend Server
+IBM Women & Tech NL Workshop, July 3
+
+Endpoints
+---------
+GET  /               Serves the v2 HTML frontend
+GET  /health         Liveness check
+POST /pipeline/fetch Returns curated article candidates for human selection
+POST /pipeline/write Generates the newsletter from selected articles
+
+Run
+---
+    source venv/bin/activate
+    orchestrate env activate workshop
+    uvicorn app-v2:app --port 8080 --reload
+
+File layout (search for these headers to jump around)
+-------------------------------------------------------
+    1. Config & models
+    2. wxO auth + HTTP helpers
+    3. Parsing agent responses (text/JSON extraction)
+    4. wxO run orchestration (start a run, poll it to completion)
+    5. Prompt builders
+    6. Article parsing & normalization (tables, dates, dedup)
+    7. Routes
+"""
+
+import os
+import re
+import time
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("newsletter-v2")
+
+app = FastAPI(title="Newsletter Companion Backend v2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ═══ 1. Config & models ═══════════════════════════════════════════════════════
+
+WXO_BASE          = "https://api.us-south.watson-orchestrate.cloud.ibm.com/instances/7d69bd15-9790-4444-816e-624128830904"
+FLOW_AGENT_ID     = "81ac86e8-d87b-4b62-8f40-dcab8a555cec"
+TOPIC_AGENT_ID    = "74da238d-8882-4c1d-82cb-eef29e86d31f"
+FETCH_AGENT_ID    = "883218f9-bf86-41dd-a5be-06bd1ec1433f"
+CURATION_AGENT_ID = "c060d43e-4435-4e1d-b806-8b7186e3438c"
+API_KEY           = "HkJooKNuqO2I6A8V9EUkSsHlCstYRYEPupsm1lRTmeuj"
+IAM_URL           = "https://iam.cloud.ibm.com/identity/token"
+
+POLL_TIMEOUT = 180   # seconds to wait for a wxO run to finish
+POLL_INTERVAL = 4    # seconds between polls
+MAX_ARTICLES = 10    # hard cap on articles returned/used, regardless of agent output
+
+TIME_WINDOW_DAYS = {
+    "last 7 days": 7,
+    "last 30 days": 30,
+    "last 3 months": 90,
+    "last year": 365,
+}
+
+_token_cache = {"value": None, "exp": 0}
+
+
+class PipelineFetchRequest(BaseModel):
+    intent: str
+    keywords: list[str] = []
+    tone: str = "Conversational"
+    audience: str = "Working knowledge"
+    timeWindow: str = "Last 7 days"
+    length: str = "Short"
+
+
+class ArticleSelection(BaseModel):
+    title: str
+    source: str = ""
+    date: str = ""
+    snippet: str = ""
+    relevance: str = "med"
+    url: str = ""
+
+
+class PipelineWriteRequest(BaseModel):
+    intent: str
+    keywords: list[str] = []
+    tone: str = "Conversational"
+    audience: str = "Working knowledge"
+    timeWindow: str = "Last 7 days"
+    length: str = "Short"
+    articles: list[ArticleSelection] = []
+
+
+# ═══ 2. wxO auth + HTTP helpers ════════════════════════════════════════════════
+
+def get_wxo_token() -> str:
+    if _token_cache["value"] and time.time() < _token_cache["exp"]:
+        return _token_cache["value"]
+
+    r = httpx.post(
+        IAM_URL,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": API_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    _token_cache["value"] = data["access_token"]
+    _token_cache["exp"] = time.time() + data.get("expires_in", 3600) - 300
+    return _token_cache["value"]
+
+
+def _headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+# ═══ 3. Parsing agent responses ════════════════════════════════════════════════
+# wxO can hand back plain text, nested JSON, or SSE-style events depending on the
+# agent and whether the call was sync/async. These helpers dig the actual text or
+# JSON payload out of whatever shape comes back.
+
+def _json_if_possible(x):
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return x
+    return x
+
+
+def _extract_json_object(text: str):
+    """Find the first balanced {...} object anywhere in a string."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except Exception:
+                            break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _extract_text_from_content(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                for key in ("text", "value", "content"):
+                    val = block.get(key)
+                    if isinstance(val, str) and val.strip():
+                        parts.append(val.strip())
+        return "\n".join(parts).strip()
+
+    if isinstance(content, dict):
+        for key in ("text", "value", "content", "message"):
+            val = content.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    return ""
+
+
+def _collect_texts(obj) -> list[str]:
+    """Recursively pull every plausible text field out of an event/message payload."""
+    obj = _json_if_possible(obj)
+
+    if isinstance(obj, str):
+        s = obj.strip()
+        return [s] if s else []
+
+    if isinstance(obj, list):
+        out = []
+        for item in obj:
+            out.extend(_collect_texts(item))
+        return out
+
+    if isinstance(obj, dict):
+        out = []
+        for key in ("text", "delta", "value", "output", "response", "answer", "generated_text"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                out.append(val.strip())
+            elif isinstance(val, (dict, list)):
+                out.extend(_collect_texts(val))
+        for key in ("content", "message", "result", "data"):
+            if key in obj:
+                out.extend(_collect_texts(obj[key]))
+        return out
+
+    return []
+
+
+def _looks_like_original_prompt(text: str) -> bool:
+    t = text.strip().lower()
+    return t.startswith("create newsletter\nkeyword:") or t.startswith("create newsletter keyword:")
+
+
+def _is_system_noise(text: str) -> bool:
+    t = text.strip().lower()
+    return any(p in t for p in (
+        "a new flow has started",
+        "this chat session is currently dedicated to the flow",
+        "will resume once the flow is complete",
+    ))
+
+
+def _is_async_placeholder(msg: dict) -> bool:
+    props = msg.get("additional_properties", {}) or {}
+    display = props.get("display_properties", {}) or {}
+    if display.get("is_async") or display.get("skip_render"):
+        return True
+    return _is_system_noise(_extract_text_from_content(msg.get("content", "")))
+
+
+# ═══ 4. wxO run orchestration ══════════════════════════════════════════════════
+# Flow: start_wxo_run() kicks off a run -> poll_wxo_run() waits for it to finish
+# and pulls the assistant's reply out of the thread (or, failing that, the raw
+# run events). run_wxo_agent() is the one-call convenience wrapper routes use.
+
+def start_wxo_run(token: str, prompt: str, agent_id: str = FLOW_AGENT_ID) -> dict:
+    url = f"{WXO_BASE}/v1/orchestrate/runs"
+    payload = {
+        "message": {
+            "role": "user",
+            "content": [{"id": "1", "response_type": "text", "text": prompt}],
+        },
+        "agent_id": agent_id,
+    }
+
+    r = httpx.post(url, headers=_headers(token), json=payload, timeout=60)
+    log.info("start_wxo_run agent_id=%s status=%s body=%s", agent_id, r.status_code, r.text[:2000])
+    if r.status_code == 422:
+        payload["message"]["content"] = prompt
+        r = httpx.post(url, headers=_headers(token), json=payload, timeout=60)
+        log.info("start_wxo_run retry agent_id=%s status=%s body=%s", agent_id, r.status_code, r.text[:2000])
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_thread_messages(token: str, thread_id: str):
+    for url in (
+        f"{WXO_BASE}/v1/orchestrate/threads/{thread_id}/messages",
+        f"{WXO_BASE}/api/v1/threads/{thread_id}/messages",
+    ):
+        r = httpx.get(url, headers=_headers(token), timeout=30)
+        log.info("get_thread_messages thread_id=%s status=%s body=%s", thread_id, r.status_code, r.text[:4000])
+        if r.status_code == 200:
+            body = r.json()
+            return body.get("messages", body) if isinstance(body, dict) else body
+    return None
+
+
+def poll_thread_for_newsletter(token: str, thread_id: str) -> str:
+    deadline = time.time() + POLL_TIMEOUT
+    while time.time() < deadline:
+        messages = _get_thread_messages(token, thread_id)
+        if messages is None:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        for msg in reversed(messages or []):
+            if msg.get("role") != "assistant" or _is_async_placeholder(msg):
+                continue
+            text = _extract_text_from_content(msg.get("content", ""))
+            if text and not _is_system_noise(text) and not _looks_like_original_prompt(text):
+                return text
+
+        time.sleep(POLL_INTERVAL)
+
+    raise TimeoutError(f"Timed out waiting for newsletter in thread {thread_id}")
+
+
+def get_run_events(token: str, run_id: str):
+    url = f"{WXO_BASE}/v1/orchestrate/runs/{run_id}/events"
+    r = httpx.get(url, headers=_headers(token), timeout=30)
+    log.info("get_run_events run_id=%s status=%s body=%s", run_id, r.status_code, r.text[:4000])
+    r.raise_for_status()
+    body = r.json()
+    return body.get("events", body) if isinstance(body, dict) else body
+
+
+def get_run_events_text(token: str, run_id: str) -> str:
+    """Fallback for when a run has no thread: pull assistant text straight out of events."""
+    for attempt in range(10):
+        events = get_run_events(token, run_id)
+        log.info("get_run_events_text attempt=%s run_id=%s event_count=%s", attempt + 1, run_id, len(events or []))
+
+        completed_texts, delta_texts = [], []
+        for ev in events or []:
+            event_type = ev.get("event") or ev.get("type") or ""
+            data = _json_if_possible(ev.get("data", {}))
+
+            role = data.get("role") if isinstance(data, dict) else None
+            if isinstance(data, dict) and isinstance(data.get("message"), dict):
+                role = data["message"].get("role", role)
+            if role == "user":
+                continue
+
+            texts = [t for t in _collect_texts(data) if t and not _looks_like_original_prompt(t) and not _is_system_noise(t)]
+            if event_type == "message.completed" or event_type in ("run.completed", "summary", "done"):
+                completed_texts.extend(texts)
+            elif event_type == "message.delta":
+                delta_texts.extend(texts)
+
+        if completed_texts:
+            return "\n".join(completed_texts).strip()
+        if delta_texts:
+            return "".join(delta_texts).strip()
+
+        time.sleep(3)
+
+    raise RuntimeError("Run completed, but no assistant text was found in run events")
+
+
+def poll_wxo_run(token: str, run_id: str, thread_id: str | None = None) -> str:
+    url = f"{WXO_BASE}/v1/orchestrate/runs/{run_id}"
+    deadline = time.time() + POLL_TIMEOUT
+
+    while time.time() < deadline:
+        r = httpx.get(url, headers=_headers(token), timeout=30)
+        log.info("poll_wxo_run run_id=%s status=%s body=%s", run_id, r.status_code, r.text[:3000])
+        r.raise_for_status()
+        run = r.json()
+        status = run.get("status")
+        thread_id = thread_id or run.get("thread_id")
+
+        if status in ("completed", "async_completed"):
+            return poll_thread_for_newsletter(token, thread_id) if thread_id else get_run_events_text(token, run_id)
+        if status in ("failed", "cancelled", "expired"):
+            raise RuntimeError(f"Run {status}: {run.get('last_error') or run}")
+        if status == "requires_input":
+            raise RuntimeError("Run requires additional user input; this backend expects a one-shot stage")
+
+        time.sleep(POLL_INTERVAL)
+
+    raise TimeoutError("Timed out waiting for the agent response")
+
+
+def run_wxo_agent(token: str, prompt: str, agent_id: str = FLOW_AGENT_ID) -> str:
+    started = start_wxo_run(token, prompt, agent_id=agent_id)
+    return poll_wxo_run(token, started["run_id"], started.get("thread_id"))
+
+
+# ═══ 5. Prompt builders ════════════════════════════════════════════════════════
+
+def _time_window_days(time_window: str) -> int:
+    return TIME_WINDOW_DAYS.get((time_window or "").strip().lower(), 7)
+
+
+def build_topic_prompt(ctx: dict) -> str:
+    return ctx.get("intent", "")
+
+
+def build_fetch_agent_prompt(keyword_list: list[str], time_window: str) -> str:
+    days = _time_window_days(time_window)
+    today = datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=days)
+    return (
+        "Fetch Google News articles for these keywords.\n"
+        f"keyword_list: {', '.join(keyword_list)}\n"
+        f"Use queries, language en-US, maxItems {MAX_ARTICLES}, waitSecs 30.\n"
+        f"Today's date is {today.isoformat()}. Only include articles published on or after "
+        f"{cutoff.isoformat()} (the last {days} days, matching the '{time_window}' window the user "
+        "selected). Exclude anything published before that date, even if it is otherwise relevant.\n"
+        "Return the full raw output from the fetch and dataset retrieval steps."
+    )
+
+
+def build_direct_curation_prompt(keyword_list: list[str], news_content: str, time_window: str) -> str:
+    days = _time_window_days(time_window)
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    return (
+        "Please curate these articles.\n"
+        f"keyword_list: {', '.join(keyword_list)}\n"
+        "threshold_score: 50\n"
+        f"Only keep articles published on or after {cutoff} (the '{time_window}' window). "
+        "Drop any article older than that, regardless of its relevance score.\n"
+        f"news_content: {news_content}"
+    )
+
+
+def build_write_prompt(ctx: dict) -> str:
+    article_lines = [
+        f"{i}. {a.get('title', '')} | {a.get('source', '')} | {a.get('date', '')}\n   {a.get('snippet', '')}"
+        for i, a in enumerate(ctx.get("articles", []), start=1)
+    ]
+    return (
+        "write newsletter from selected articles\n"
+        f"topic: {ctx.get('intent', '')}\n"
+        f'"tone": "{ctx.get("tone", "Conversational")}", '
+        f'"length": "{ctx.get("length", "Short")}",\n'
+        f'technical level: {ctx.get("audience", "Working knowledge")}\n'
+        "selected articles:\n"
+        f"{chr(10).join(article_lines)}\n\n"
+        "Formatting rules: write in plain prose only. Do not use markdown "
+        "(no **bold**, no #, no tables, no bullet lists), do not use em dashes "
+        "or double-hyphen dashes, and do not use emoji or decorative symbols."
+    )
+
+
+# ═══ 6. Article parsing & normalization ════════════════════════════════════════
+
+# Header names an agent's markdown table might use, mapped to the field they mean.
+# Parsing the header lets us place values correctly no matter what order the
+# agent's table columns come in (instead of assuming a fixed position).
+_COLUMN_ALIASES = {
+    "date": "date", "pub date": "date", "published": "date", "published_at": "date", "publish date": "date",
+    "title": "title", "headline": "title",
+    "snippet": "snippet", "summary": "snippet", "description": "snippet",
+    "source": "source", "publisher": "source", "outlet": "source",
+    "url": "url", "link": "url",
+    "relevance": "relevance", "score": "relevance",
+}
+_HEADER_TOKENS = set(_COLUMN_ALIASES) | {"#", "no."}
+
+_DATE_FORMATS = (
+    "%a, %d %b %Y %H:%M:%S %Z",   # Fri, 28 Nov 2025 08:00:00 GMT
+    "%Y-%m-%dT%H:%M:%S%z",        # 2026-06-30T08:00:00+00:00
+    "%Y-%m-%dT%H:%M:%SZ",         # 2026-06-30T08:00:00Z
+    "%Y-%m-%d",                   # 2026-06-30
+    "%d %b %Y",                   # 30 Jun 2026
+    "%d %B %Y",                   # 30 June 2026
+    "%B %d, %Y",                  # June 30, 2026
+    "%b %d, %Y",                  # Jun 30, 2026
+    "%m/%d/%Y",                   # 06/30/2026
+)
+
+
+def _is_header_leak(title: str, source: str, date: str, snippet: str) -> bool:
+    """True if this "article" is actually a markdown table header row that slipped through."""
+    values = [v.strip().lower() for v in (title, source, date, snippet) if v and v.strip()]
+    return bool(values) and all(v in _HEADER_TOKENS for v in values)
+
+
+def _normalize_article(article: dict) -> dict:
+    return {
+        "title": article.get("title") or article.get("headline") or article.get("name") or "Untitled article",
+        "source": article.get("source") or article.get("publisher") or article.get("outlet") or "",
+        "date": article.get("date") or article.get("published_at") or article.get("published") or "",
+        "snippet": article.get("snippet") or article.get("summary") or article.get("description") or "",
+        "relevance": str(article.get("relevance") or article.get("score") or "med").lower(),
+        "url": article.get("url") or article.get("link") or "",
+    }
+
+
+def _normalize_and_filter(raw_articles: list) -> list[dict]:
+    articles = [_normalize_article(a) for a in raw_articles if isinstance(a, dict)]
+    return [a for a in articles if not _is_header_leak(a["title"], a["source"], a["date"], a["snippet"])]
+
+
+def _article_from_row(cells: list[str], column_map: list[str | None] | None) -> dict:
+    values: dict[str, str] = {}
+    if column_map:
+        for i, val in enumerate(cells):
+            field = column_map[i] if i < len(column_map) else None
+            if field and field not in values:
+                values[field] = val.strip()
+
+    # If the header couldn't be matched to known column names, fall back to the
+    # conventional [date, title, snippet, source, url] positional order.
+    if not values.get("title"):
+        padded = list(cells) + [""] * max(0, 5 - len(cells))
+        values.setdefault("date", padded[0])
+        values.setdefault("title", padded[1])
+        values.setdefault("snippet", padded[2])
+        values.setdefault("source", padded[3])
+        values.setdefault("url", padded[4])
+
+    snippet = values.get("snippet", "")
+    if snippet.strip().lower() == "no summary provided":
+        snippet = ""
+
+    return {
+        "date": values.get("date", ""),
+        "title": values.get("title") or "Untitled article",
+        "snippet": snippet,
+        "source": values.get("source", ""),
+        "url": values.get("url", ""),
+        "relevance": (values.get("relevance") or "med").lower(),
+    }
+
+
+def _extract_news_results_table(raw_text: str) -> list[dict]:
+    """Parse a markdown table of articles, using the header row to map columns
+    (rather than assuming a fixed order) and dropping the header itself."""
+    rows: list[tuple[list[str], list[str | None] | None]] = []
+    block_open = False
+    column_map: list[str | None] | None = None
+
+    for line in (l.strip() for l in raw_text.splitlines()):
+        is_table_line = bool(line) and line.startswith("|") and line.endswith("|")
+        if not is_table_line:
+            block_open = False
+            column_map = None
+            continue
+        if set(line.replace("|", "").strip()) == {"-"}:
+            continue  # separator row between header and body
+
+        cells = [part.strip() for part in line.strip("|").split("|")]
+        if not block_open:
+            block_open = True
+            column_map = [_COLUMN_ALIASES.get(c.lower()) for c in cells]
+            continue
+        rows.append((cells, column_map))
+
+    articles = [_article_from_row(cells, cmap) for cells, cmap in rows if len(cells) >= 2]
+    return [a for a in articles if not _is_header_leak(a["title"], a["source"], a["date"], a["snippet"])]
+
+
+def parse_fetch_result(raw_text: str) -> dict:
+    """Normalize a fetch/curation agent's reply (JSON object, JSON list, or
+    markdown table) into {keyword_list, news_content, curated_articles}."""
+    parsed = _json_if_possible(raw_text)
+    if isinstance(parsed, str):
+        parsed = _extract_json_object(parsed) or parsed
+
+    if isinstance(parsed, list):
+        articles = _normalize_and_filter(parsed)
+        return {"news_content": articles, "curated_articles": articles}
+
+    if isinstance(parsed, dict):
+        news_content = parsed.get("news_content") or parsed.get("articles") or []
+        curated_articles = parsed.get("curated_articles") or parsed.get("approved_articles") or news_content
+        if isinstance(news_content, dict):
+            news_content = news_content.get("articles") or []
+        if isinstance(curated_articles, dict):
+            curated_articles = curated_articles.get("articles") or []
+        return {
+            "keyword_list": parsed.get("keyword_list") or [],
+            "news_content": _normalize_and_filter(news_content),
+            "curated_articles": _normalize_and_filter(curated_articles),
+        }
+
+    articles = _extract_news_results_table(raw_text)
+    if articles:
+        return {"news_content": articles, "curated_articles": articles}
+
+    raise RuntimeError("Agent did not return fetch-stage JSON")
+
+
+def _parse_article_date(date_str: str) -> datetime | None:
+    """Best-effort parse across the date formats agents/news sources return.
+    Returns None when unparseable, so we never guess an article in or out of range."""
+    if not date_str or not date_str.strip():
+        return None
+    s = date_str.strip()
+
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        pass
+
+    for fmt in _DATE_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)  # last resort: bare YYYY-MM-DD anywhere in the string
+    if match:
+        try:
+            return datetime(*map(int, match.groups()), tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    return None
+
+
+def _filter_by_time_window(articles: list[dict], time_window: str) -> list[dict]:
+    """Drop articles confidently outside the selected window. Unparseable dates are
+    kept, since an unverifiable date beats silently discarding a relevant article."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_time_window_days(time_window))
+    kept, dropped = [], 0
+    for a in articles:
+        parsed = _parse_article_date(a.get("date", ""))
+        if parsed is not None and parsed < cutoff:
+            dropped += 1
+            continue
+        kept.append(a)
+    if dropped:
+        log.info("time window filter: dropped %s article(s) older than %s (window=%s)", dropped, cutoff.date(), time_window)
+    return kept
+
+
+# ═══ 7. Routes ══════════════════════════════════════════════════════════════════
+
+@app.get("/")
+def index():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "newsletter-companion-v2.html")
+    return FileResponse(path, media_type="text/html")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/pipeline/fetch")
+def pipeline_fetch(req: PipelineFetchRequest):
+    ctx = req.model_dump()
+    time_window = ctx.get("timeWindow", "Last 7 days")
+    try:
+        token = get_wxo_token()
+
+        topic_text = run_wxo_agent(token, build_topic_prompt(ctx), agent_id=TOPIC_AGENT_ID)
+        keyword_list = [k.strip() for k in topic_text.replace("\n", ",").split(",") if k.strip()]
+        if not keyword_list:
+            keyword_list = ctx.get("keywords") or [ctx.get("intent", "")]
+
+        raw_news_text = run_wxo_agent(token, build_fetch_agent_prompt(keyword_list, time_window), agent_id=FETCH_AGENT_ID)
+        parsed_news = parse_fetch_result(raw_news_text)
+
+        curated_text = run_wxo_agent(
+            token, build_direct_curation_prompt(keyword_list, raw_news_text, time_window), agent_id=CURATION_AGENT_ID
+        )
+        curated_result = parse_fetch_result(curated_text)
+        curated_articles = curated_result.get("curated_articles") or curated_result.get("news_content") or parsed_news.get("news_content", [])
+
+        # The agent is told the cutoff date in the prompt above, but agents don't always
+        # respect it reliably, so enforce the selected time window here as a hard backstop.
+        news_content = _filter_by_time_window(parsed_news.get("news_content", []), time_window)[:MAX_ARTICLES]
+        curated_articles = _filter_by_time_window(curated_articles, time_window)[:MAX_ARTICLES]
+
+        return {"keyword_list": keyword_list, "news_content": news_content, "curated_articles": curated_articles}
+    except Exception as e:
+        raise HTTPException(502, f"fetch: {e}")
+
+
+@app.post("/pipeline/write")
+def pipeline_write(req: PipelineWriteRequest):
+    if not req.articles:
+        raise HTTPException(400, "At least one article is required")
+
+    ctx = req.model_dump()
+    ctx["articles"] = [a.model_dump() for a in req.articles][:MAX_ARTICLES]
+
+    try:
+        token = get_wxo_token()
+        raw_text = run_wxo_agent(token, build_write_prompt(ctx))
+        return {"raw_text": raw_text}
+    except TimeoutError as e:
+        raise HTTPException(504, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"write: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8080)
