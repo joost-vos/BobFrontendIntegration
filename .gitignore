@@ -1,6 +1,9 @@
 # Credentials — never commit
 .env
 
+# Bob internal rules
+.bob/
+
 # Python
 __pycache__/
 *.py[cod]
