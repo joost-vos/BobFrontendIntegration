@@ -881,48 +881,92 @@
       .trim();
   }
 
+  // ── Derive a short readable label from a hostname ────────────────────────────
+  // e.g. "www.marketbeat.com" → "MarketBeat", "finance.yahoo.com" → "Yahoo"
+  function _labelFromHost(hostname) {
+    // strip leading www. / m. / finance. / news. / etc.
+    const core = hostname.replace(/^(?:www\d?|m|finance|news|business|markets|investing)\./i, '');
+    const name = core.split('.')[0];                        // "marketbeat" from "marketbeat.com"
+    // Title-case and expand common run-together names
+    return name.charAt(0).toUpperCase() + name.slice(1)    // "Marketbeat"
+      .replace(/([a-z])([A-Z])/g, '$1 $2');                // no-op for most, safety for camelCase
+  }
+
   // ── Replace bare inline URLs with [N] citation markers ───────────────────────
-  // urlIndex: Map<url-string, 1-based-number> built from selectedArticles.
-  // Handles: plain https://..., (https://...), and "Source (https://...)" patterns.
-  // Returns the paragraph text with URLs replaced by superscript-style [N] markers.
-  // If a URL is not in the index (agent hallucinated a URL not in our list), it
-  // is simply removed rather than left as a raw URL.
-  function replaceCitationUrls(text, urlIndex) {
-    if (!urlIndex || urlIndex.size === 0) {
-      // No index — just strip all bare and parenthesised URLs
-      return text
+  // urlIndex:  Map<exact-url-string, 1-based-number>
+  // hostIndex: Map<hostname, {n, label}> — fallback when exact URL not found
+  // Both maps are built in populateReview from selectedArticles.
+  //
+  // Handles every pattern the agent produces:
+  //   ((https://url))        double-paren (most common agent quirk)
+  //   (https://url)          single-paren
+  //   Word (https://url)     named-source  → "Word [N]"
+  //   https://url            bare URL
+  //
+  // Unknown URLs (not in either index) are removed cleanly — never left as raw text.
+  function replaceCitationUrls(text, urlIndex, hostIndex) {
+    // ── Step 0: normalise double/triple parens wrapping a URL → single parens ──
+    // Catches ((url)), (((url))), (( url )) etc.
+    text = text.replace(/\(+\s*(https?:\/\/[^\s)]{1,500})\s*\)+/g, '($1)');
+
+    const _resolve = (rawUrl) => {
+      const url = rawUrl.trim().replace(/[.,;:!?)"']+$/, '');
+      // 1. Exact match
+      if (urlIndex && urlIndex.has(url)) return { n: urlIndex.get(url), label: null };
+      // 2. Hostname fallback
+      try {
+        const host = new URL(url).hostname;
+        if (hostIndex && hostIndex.has(host)) return hostIndex.get(host);
+      } catch (_) {}
+      // 3. Unknown — no marker, just remove
+      return null;
+    };
+
+    const _marker = (resolved, word) => {
+      if (!resolved) return word || '';
+      const label = resolved.label || (word && word !== '(' ? word : null);
+      return (label ? label + '\u202f' : '') + '[' + resolved.n + ']';
+    };
+
+    if (!urlIndex && !hostIndex) {
+      // No index available — strip all URL forms cleanly
+      text = text
         .replace(/\(\s*https?:\/\/[^\s)]{1,500}\s*\)/g, '')
-        .replace(/https?:\/\/\S{1,500}/g, '')
-        .replace(/[ \t]{2,}/g, ' ')
-        .trim();
+        .replace(/https?:\/\/\S{1,500}/g, '');
+      return text.replace(/\(\s*\)/g, '').replace(/[ \t]{2,}/g, ' ').trim();
     }
 
-    // Replace "Word (https://url)" → "Word [N]"  (named-source pattern)
+    // ── Step 1: "Word (https://url)" → "Word [N]" ──────────────────────────────
     text = text.replace(
       /(\S+)\s+\(\s*(https?:\/\/[^\s)]{1,500})\s*\)/g,
       (match, word, url) => {
-        const n = urlIndex.get(url.trim());
-        return n !== undefined ? word + '\u202f[' + n + ']' : word;
+        const r = _resolve(url);
+        return _marker(r, word);
       }
     );
 
-    // Replace remaining "(https://url)" → "[N]"  (bare parenthesised URL)
+    // ── Step 2: remaining "(https://url)" → "[N]" ──────────────────────────────
     text = text.replace(
       /\(\s*(https?:\/\/[^\s)]{1,500})\s*\)/g,
       (match, url) => {
-        const n = urlIndex.get(url.trim());
-        return n !== undefined ? '\u202f[' + n + ']' : '';
+        const r = _resolve(url);
+        return r ? '\u202f[' + r.n + ']' : '';
       }
     );
 
-    // Replace any remaining bare "https://url" → "[N]"
+    // ── Step 3: bare "https://url" → "[N]" ─────────────────────────────────────
     text = text.replace(
       /https?:\/\/\S{1,500}/g,
       (url) => {
-        const n = urlIndex.get(url.trim().replace(/[.,;:!?)]+$/, ''));
-        return n !== undefined ? '\u202f[' + n + ']' : '';
+        const r = _resolve(url);
+        if (!r) return '';
+        const label = r.label;
+        return (label ? label + '\u202f' : '') + '[' + r.n + ']';
       }
     );
+
+    // ── Step 4: strip any stray empty paren pairs left over ─────────────────────
+    text = text.replace(/\(\s*\)/g, '');
 
     return text.replace(/[ \t]{2,}/g, ' ').trim();
   }
@@ -931,12 +975,24 @@
   // selectedArticles: array of article objects (title, source, url, date) from the
   //   selection stage — used to build the Sources section with real hyperlinks.
   function populateReview(rawText, ctx, selectedArticles) {
-    // Build a URL → 1-based index map from the articles that have URLs.
-    // This lets replaceCitationUrls() convert bare URLs to [N] markers that
-    // match the numbered Sources list rendered at the bottom.
+    // Build URL lookup maps from the articles that have URLs.
+    // urlIndex:  exact URL  → 1-based position  (fast path)
+    // hostIndex: hostname   → {n, label}         (fallback for abbreviated agent URLs)
     const articlesWithUrl = (selectedArticles || []).filter(a => a && a.url);
-    const urlIndex = new Map();
-    articlesWithUrl.forEach((a, i) => urlIndex.set(a.url, i + 1));
+    const urlIndex  = new Map();
+    const hostIndex = new Map();
+    articlesWithUrl.forEach((a, i) => {
+      const n = i + 1;
+      urlIndex.set(a.url, n);
+      try {
+        const host = new URL(a.url).hostname;
+        // Only store the first article per hostname to avoid ambiguous matches
+        if (!hostIndex.has(host)) {
+          const label = a.source || _labelFromHost(host);
+          hostIndex.set(host, { n, label });
+        }
+      } catch (_) {}
+    });
 
     rawText = cleanLlmText(rawText);
 
@@ -951,7 +1007,7 @@
 
     // Render greeting (first body para) separately in the styled greeting element
     document.getElementById('nlGreeting').textContent =
-      replaceCitationUrls(bodyParas[0] || '', urlIndex);
+      replaceCitationUrls(bodyParas[0] || '', urlIndex, hostIndex);
 
     // Remaining paragraphs rendered as clean readable prose blocks — no fake headlines
     const container = document.getElementById('nlArticles');
@@ -961,7 +1017,7 @@
       p.className = 'nl-para';
       p.setAttribute('data-ed', '');
       p.setAttribute('contenteditable', 'false');
-      p.textContent = replaceCitationUrls(para, urlIndex);
+      p.textContent = replaceCitationUrls(para, urlIndex, hostIndex);
       container.appendChild(p);
     });
 
