@@ -193,6 +193,12 @@
   .nl-article p{font-size:13px;color:var(--gray-70);margin:0 0 var(--s8);line-height:1.6;}
   .nl-para{font-size:14px;color:#1f2328;line-height:1.75;margin:0 0 var(--s16);font-family:Georgia,'Times New Roman',serif;}
   .nl-para:last-child{margin-bottom:0;}
+  .nl-sources{margin-top:var(--s24);padding-top:var(--s16);border-top:1px solid var(--gray-20);}
+  .nl-sources h5{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--gray-60);margin:0 0 var(--s8);}
+  .nl-sources ol{margin:0;padding-left:var(--s16);}
+  .nl-sources li{font-size:12px;color:var(--gray-70);line-height:1.5;margin-bottom:var(--s4);}
+  .nl-sources a{color:var(--blue-60);text-decoration:none;}
+  .nl-sources a:hover{text-decoration:underline;}
   .nl-footer{padding:var(--s16) var(--s24);font-size:11px;color:var(--gray-60);
     border-top:1px solid var(--gray-20);}
   .nl-card.editing [data-ed]{outline:1px dashed var(--blue-60);outline-offset:2px;border-radius:2px;cursor:text;}
@@ -874,7 +880,9 @@
   }
 
   // ── Populate review from agent prose ─────────────────────────────────────────
-  function populateReview(rawText, ctx, selectedCount) {
+  // selectedArticles: array of article objects (title, source, url, date) from the
+  //   selection stage — used to build the Sources section with real hyperlinks.
+  function populateReview(rawText, ctx, selectedArticles) {
     rawText = cleanLlmText(rawText);
 
     // Split into paragraphs; first non-empty line is the title
@@ -901,6 +909,35 @@
       container.appendChild(p);
     });
 
+    // ── Sources section — one linked entry per selected article ─────────────────
+    const articlesWithUrl = (selectedArticles || []).filter(a => a && a.url);
+    if (articlesWithUrl.length) {
+      const section = document.createElement('div');
+      section.className = 'nl-sources';
+      const heading = document.createElement('h5');
+      heading.textContent = 'Sources';
+      const ol = document.createElement('ol');
+      articlesWithUrl.forEach(a => {
+        const li  = document.createElement('li');
+        const link = document.createElement('a');
+        link.href   = a.url;
+        link.target = '_blank';
+        link.rel    = 'noopener noreferrer';
+        link.textContent = a.title || a.source || a.url;
+        if (a.source) {
+          li.appendChild(link);
+          li.appendChild(document.createTextNode(' — ' + a.source));
+        } else {
+          li.appendChild(link);
+        }
+        ol.appendChild(li);
+      });
+      section.appendChild(heading);
+      section.appendChild(ol);
+      container.appendChild(section);
+    }
+
+    const selectedCount = (selectedArticles || []).length;
     document.getElementById('metaTopic').textContent = ctx.intent;
     document.getElementById('metaTone').textContent = ctx.tone;
     document.getElementById('metaLevel').textContent = ctx.tech;
@@ -1069,7 +1106,7 @@
     try {
       const raw = await callWrite(window._pipelineCtx, selected);
       stopGenAnimation();
-      populateReview(raw, window._pipelineCtx, selected.length);
+      populateReview(raw, window._pipelineCtx, selected);
       goStage(5);
     } catch (e) {
       stopGenAnimation();
@@ -1098,7 +1135,16 @@
     const greeting = document.getElementById('nlGreeting')?.textContent || '';
     const paras    = Array.from(document.querySelectorAll('#nlArticles .nl-para'))
                          .map(p => p.textContent).join('\n\n');
-    return [title, greeting, paras].filter(Boolean).join('\n\n');
+    // Sources as plain text with URLs
+    const sourceItems = Array.from(document.querySelectorAll('#nlArticles .nl-sources li'));
+    const sources = sourceItems.length
+      ? 'Sources:\n' + sourceItems.map((li, i) => {
+          const a = li.querySelector('a');
+          const label = li.textContent.trim();
+          return (i + 1) + '. ' + label + (a ? ' (' + a.href + ')' : '');
+        }).join('\n')
+      : '';
+    return [title, greeting, paras, sources].filter(Boolean).join('\n\n');
   }
 
   // ── Build HTML e-mail body from the newsletter card ───────────────────────────
@@ -1109,6 +1155,22 @@
     const paras    = Array.from(document.querySelectorAll('#nlArticles .nl-para'))
                          .map(p => '<p style="font-family:Georgia,serif;font-size:15px;line-height:1.75;color:#1f2328;margin:0 0 18px">' + escHtml(p.textContent) + '</p>')
                          .join('');
+    // Sources section for the email — anchors with href preserved
+    const sourceItems = Array.from(document.querySelectorAll('#nlArticles .nl-sources li'));
+    const sourcesHtml = sourceItems.length
+      ? '<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px;border-top:1px solid #e5e7eb;padding-top:16px">' +
+        '<tr><td><p style="font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#6f6f6f;margin:0 0 8px">Sources</p>' +
+        '<ol style="margin:0;padding-left:18px">' +
+        sourceItems.map(li => {
+          const a = li.querySelector('a');
+          if (!a) return '<li style="font-size:12px;color:#525252;line-height:1.5;margin-bottom:4px">' + escHtml(li.textContent) + '</li>';
+          const label = escHtml(a.textContent);
+          const rest  = escHtml(li.textContent.replace(a.textContent, ''));
+          return '<li style="font-size:12px;color:#525252;line-height:1.5;margin-bottom:4px">' +
+            '<a href="' + escHtml(a.href) + '" style="color:#0f62fe;text-decoration:none" target="_blank">' + label + '</a>' + rest + '</li>';
+        }).join('') +
+        '</ol></td></tr></table>'
+      : '';
     return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif">
@@ -1122,6 +1184,7 @@
         <tr><td style="padding:32px">
           <p style="font-family:Georgia,serif;font-size:15px;line-height:1.75;color:#1f2328;margin:0 0 24px;padding-bottom:16px;border-bottom:1px solid #e5e7eb">${greeting}</p>
           ${paras}
+          ${sourcesHtml}
         </td></tr>
         <tr><td style="padding:16px 32px;border-top:1px solid #e5e7eb;font-size:11px;color:#6e6e6e">
           You are receiving this because you follow this topic. © IBM
