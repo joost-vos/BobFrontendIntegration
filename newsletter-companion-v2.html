@@ -97,11 +97,7 @@
     background:#fff;color:var(--gray-70);cursor:pointer;display:inline-flex;align-items:center;gap:6px;}
   .tag.sel{background:#edf5ff;border-color:var(--blue-60);color:var(--blue-80);}
   .tag.ghost{border-style:dashed;color:var(--gray-60);}
-  #btnExpand{margin-top:var(--s12);font-size:12px;padding:6px 14px;min-height:unset;display:inline-flex;align-items:center;gap:6px;}
-  #btnExpand .spin{width:12px;height:12px;border:2px solid rgba(15,98,254,.2);border-top-color:var(--blue-60);border-radius:50%;animation:spin 0.7s linear infinite;display:none;}
-  #btnExpand.loading .spin{display:inline-block;}
-  #btnExpand.loading .lbl{opacity:.7;}
-  #kwTagsWrap{margin-top:var(--s12);display:none;}
+  #kwTags{margin-top:var(--s12);}
 
   /* ── Tiles ── */
   .tiles{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--s12);}
@@ -289,16 +285,9 @@
         <input class="field" id="intentInput" value="Women in Tech" placeholder="e.g. Women in Tech, EU AI Act, watsonx updates">
         <div class="helper">This becomes the agent's search keyword.</div>
 
-        <div style="margin-top:var(--s16)">
-          <button class="btn sec" id="btnExpand">
-            <span class="spin"></span><span class="lbl">Expand keywords</span>
-          </button>
-          <div id="kwTagsWrap">
-            <label class="label" style="margin-top:var(--s16)">Suggested keywords <span style="font-weight:400;color:var(--gray-60)">(tap to toggle)</span></label>
-            <div class="tags" id="kwTags">
-              <span class="tag ghost">+ Add</span>
-            </div>
-          </div>
+        <label class="label" style="margin-top:var(--s16)">Keywords <span style="font-weight:400;color:var(--gray-60)">(added after fetch — tap to toggle)</span></label>
+        <div class="tags" id="kwTags">
+          <span class="tag ghost">+ Add</span>
         </div>
       </div>
 
@@ -656,39 +645,6 @@
       if (e.key === 'Escape') { input.remove(); ghost.style.display = ''; }
     });
     input.addEventListener('blur', commit);
-  });
-
-  // ── Expand keywords button ────────────────────────────────────────────────────
-  document.getElementById('btnExpand').addEventListener('click', async () => {
-    const intent = document.getElementById('intentInput').value.trim();
-    if (!intent) { alert('Please enter a topic first.'); return; }
-
-    const btn = document.getElementById('btnExpand');
-    btn.classList.add('loading');
-    btn.disabled = true;
-    setStatus('status1', '');
-
-    try {
-      const resp = await fetch(PROXY + '/expand-keywords', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intent })
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: resp.statusText }));
-        throw new Error(err.detail || err.error || resp.statusText);
-      }
-      const data = await resp.json();
-      if (data.keywords && data.keywords.length) {
-        populateKeywordTags(data.keywords);
-        document.getElementById('kwTagsWrap').style.display = 'block';
-      }
-    } catch (e) {
-      setStatus('status1', '⚠ ' + e.message, true);
-    } finally {
-      btn.classList.remove('loading');
-      btn.disabled = false;
-    }
   });
 
   // ── Status banner ─────────────────────────────────────────────────────────────
