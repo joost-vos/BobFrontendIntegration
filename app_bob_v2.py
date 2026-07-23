@@ -689,7 +689,17 @@ def _relevance_tier(raw) -> str:
 
 
 def _normalize_article(article: dict) -> dict:
-    log.debug("_normalize_article keys=%s", list(article.keys()))
+    # Pick first non-None relevance field — use explicit None check so a score of 0
+    # is not skipped by the truthiness short-circuit.
+    _rel_candidates = (
+        "relevance", "relevance_score", "score", "rank", "rating",
+        "confidence", "relevance_tier", "tier",
+    )
+    _raw_rel = next(
+        (article[k] for k in _rel_candidates if article.get(k) is not None),
+        None,
+    )
+    log.info("_normalize_article keys=%s raw_rel=%r", list(article.keys()), _raw_rel)
     return {
         "title": article.get("title") or article.get("headline") or article.get("name") or "Untitled article",
         "source": article.get("source") or article.get("publisher") or article.get("outlet") or "",
@@ -699,7 +709,7 @@ def _normalize_article(article: dict) -> dict:
             or article.get("body") or article.get("content") or article.get("text")
             or article.get("excerpt") or article.get("abstract") or ""
         ),
-        "relevance": _relevance_tier(article.get("relevance") or article.get("score")),
+        "relevance": _relevance_tier(_raw_rel),
         "url": article.get("url") or article.get("link") or "",
     }
 
