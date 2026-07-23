@@ -355,19 +355,15 @@
     <div class="running-wrap">
       <div class="spinner"></div>
       <h1>Fetching articles…</h1>
-      <p class="lede" id="fetchLede" style="margin:0 auto var(--s32);text-align:center">The agent is expanding your keywords and searching for the most relevant recent articles.</p>
+      <p class="lede" id="fetchLede" style="margin:0 auto var(--s32);text-align:center">The agent is searching for the most relevant recent articles.</p>
 
       <div class="steps-list">
-        <div class="step-item" id="fs1">
-          <div class="si">1</div>
-          <div class="sl"><div class="st">Keyword expansion</div><div class="sd">Expanding your topic into search terms</div></div>
-        </div>
         <div class="step-item" id="fs2">
-          <div class="si">2</div>
+          <div class="si">1</div>
           <div class="sl"><div class="st">News fetching</div><div class="sd">Searching Google News via Apify</div></div>
         </div>
         <div class="step-item" id="fs3">
-          <div class="si">3</div>
+          <div class="si">2</div>
           <div class="sl"><div class="st">Curation &amp; scoring</div><div class="sd">Ranking articles by relevance and recency</div></div>
         </div>
       </div>
@@ -702,25 +698,15 @@
 
   // ── Fetch-phase step animation (page 2) ───────────────────────────────────────
   let _fetchTimer = null;
-  function startFetchAnimation(skipStep1) {
-    const steps = ['fs1', 'fs2', 'fs3'];
+  function startFetchAnimation() {
+    clearInterval(_fetchTimer);
+    const steps = ['fs2', 'fs3'];
     steps.forEach(id => document.getElementById(id).classList.remove('done', 'active'));
     document.getElementById('fetchNote').textContent = 'Waiting for response…';
+    document.getElementById('fetchLede').textContent = 'The agent is searching for the most relevant recent articles.';
+    document.getElementById(steps[0]).classList.add('active');
 
     let i = 0;
-    if (skipStep1) {
-      // Mark step 1 as already done; start animation at step 2
-      document.getElementById('fs1').classList.add('done');
-      document.getElementById('fs1').querySelector('.sd').textContent = 'Using your selected keywords';
-      document.getElementById('fs2').classList.add('active');
-      document.getElementById('fetchLede').textContent = 'Fetching and curating articles for your selected keywords.';
-      i = 1;
-    } else {
-      document.getElementById('fs1').querySelector('.sd').textContent = 'Expanding your topic into search terms';
-      document.getElementById('fetchLede').textContent = 'The agent is expanding your keywords and searching for the most relevant recent articles.';
-      document.getElementById(steps[0]).classList.add('active');
-    }
-
     _fetchTimer = setInterval(() => {
       if (i < steps.length) {
         document.getElementById(steps[i]).classList.replace('active', 'done');
@@ -732,7 +718,7 @@
   }
   function stopFetchAnimation() {
     clearInterval(_fetchTimer);
-    ['fs1', 'fs2', 'fs3'].forEach(id => {
+    ['fs2', 'fs3'].forEach(id => {
       const el = document.getElementById(id);
       el.classList.remove('active');
       el.classList.add('done');
@@ -1081,7 +1067,7 @@
 
     setStatus('status3', '');
     goStage(2);
-    startFetchAnimation(true);  // skipStep1 — keywords already set by user
+    startFetchAnimation();
 
     try {
       const result = await callFetch(window._pipelineCtx);
