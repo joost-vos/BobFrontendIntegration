@@ -63,13 +63,21 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from typing import Literal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("newsletter-v2")
 
 app = FastAPI(title="Newsletter Companion Backend v2 — Workshop Lab")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# C-1: Restrict CORS to the local dev origin only. Set ALLOWED_ORIGIN in .env for production.
+_ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:8080")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_ALLOWED_ORIGIN],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 
 # ═══ 1. Config & models ═══════════════════════════════════════════════════════
@@ -118,15 +126,37 @@ TIME_WINDOW_DAYS = {
 }
 
 _token_cache = {"value": None, "exp": 0}
+_token_lock = asyncio.Lock()   # H-3: prevent concurrent IAM refresh races
+
+_VALID_TONE      = ("Conversational", "Neutral", "Concise", "Formal")
+_VALID_AUDIENCE  = ("Broad audience", "Working knowledge", "Technical / expert")
+_VALID_WINDOW    = ("Last 7 days", "Last 30 days", "Last 3 months", "Last year")
+_VALID_LENGTH    = ("Short", "Medium", "Long")
+# H-2: simple email pattern — rejects newlines (header injection) and obvious non-addresses
+_EMAIL_RE = re.compile(r'^[^@\s\r\n]+@[^@\s\r\n]+\.[^@\s\r\n]+$')
 
 
+# H-1: Literal types + validators on all enum fields; intent is capped at 500 chars
 class PipelineFetchRequest(BaseModel):
     intent: str
     keywords: list[str] = []
-    tone: str = "Conversational"
-    audience: str = "Working knowledge"
-    timeWindow: str = "Last 7 days"
-    length: str = "Short"
+    tone: Literal["Conversational", "Neutral", "Concise", "Formal"] = "Conversational"
+    audience: Literal["Broad audience", "Working knowledge", "Technical / expert"] = "Working knowledge"
+    timeWindow: Literal["Last 7 days", "Last 30 days", "Last 3 months", "Last year"] = "Last 7 days"
+    length: Literal["Short", "Medium", "Long"] = "Short"
+
+    @field_validator("intent")
+    @classmethod
+    def intent_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("intent must not be empty")
+        return v[:500]
+
+    @field_validator("keywords", mode="before")
+    @classmethod
+    def cap_keywords(cls, v):
+        return [str(k)[:100] for k in (v or [])[:20]]
 
 
 class ArticleSelection(BaseModel):
@@ -141,11 +171,24 @@ class ArticleSelection(BaseModel):
 class PipelineWriteRequest(BaseModel):
     intent: str
     keywords: list[str] = []
-    tone: str = "Conversational"
-    audience: str = "Working knowledge"
-    timeWindow: str = "Last 7 days"
-    length: str = "Short"
+    tone: Literal["Conversational", "Neutral", "Concise", "Formal"] = "Conversational"
+    audience: Literal["Broad audience", "Working knowledge", "Technical / expert"] = "Working knowledge"
+    timeWindow: Literal["Last 7 days", "Last 30 days", "Last 3 months", "Last year"] = "Last 7 days"
+    length: Literal["Short", "Medium", "Long"] = "Short"
     articles: list[ArticleSelection] = []
+
+    @field_validator("intent")
+    @classmethod
+    def intent_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("intent must not be empty")
+        return v[:500]
+
+    @field_validator("keywords", mode="before")
+    @classmethod
+    def cap_keywords(cls, v):
+        return [str(k)[:100] for k in (v or [])[:20]]
 
 
 # ═══ 2. wxO auth + HTTP helpers ════════════════════════════════════════════════
@@ -169,21 +212,28 @@ async def get_wxo_token() -> str:
       both in _token_cache (see the shape used in the read path above) so
       the next call can reuse it, then return the token.
     """
+    # Fast path — no lock needed when cache is warm
     if _token_cache["value"] and time.time() < _token_cache["exp"]:
         return _token_cache["value"]
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            IAM_URL,
-            data={"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": API_KEY},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=30,
-        )
-    r.raise_for_status()
-    body = r.json()
-    _token_cache["value"] = body["access_token"]
-    _token_cache["exp"] = time.time() + body["expires_in"] - 60   # 60 s safety margin
-    return _token_cache["value"]
+    # H-3: serialize concurrent refreshes so only one IAM call fires
+    async with _token_lock:
+        # Re-check inside the lock — another coroutine may have refreshed already
+        if _token_cache["value"] and time.time() < _token_cache["exp"]:
+            return _token_cache["value"]
+
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                IAM_URL,
+                data={"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": API_KEY},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+        r.raise_for_status()
+        body = r.json()
+        _token_cache["value"] = body["access_token"]
+        _token_cache["exp"] = time.time() + body["expires_in"] - 60   # 60 s safety margin
+        return _token_cache["value"]
 
 
 def _headers(token: str) -> dict:
@@ -358,7 +408,8 @@ async def start_wxo_run(token: str, prompt: str, agent_id: str = FLOW_AGENT_ID) 
         if r.status_code == 422:
             payload["message"]["content"] = prompt
             r = await client.post(url, json=payload, headers=_headers(token), timeout=60)
-    log.info("start_wxo_run agent_id=%s status=%s body=%s", agent_id, r.status_code, r.text[:2000])
+    log.info("start_wxo_run agent_id=%s status=%s", agent_id, r.status_code)
+    log.debug("start_wxo_run body=%.2000s", r.text)   # C-2: body (may contain token) gated to DEBUG
     r.raise_for_status()
     return r.json()
 
@@ -370,7 +421,8 @@ async def _get_thread_messages(token: str, thread_id: str):
             f"{WXO_BASE}/api/v1/threads/{thread_id}/messages",
         ):
             r = await client.get(url, headers=_headers(token), timeout=30)
-            log.info("get_thread_messages thread_id=%s status=%s body=%s", thread_id, r.status_code, r.text[:4000])
+            log.info("get_thread_messages thread_id=%s status=%s", thread_id, r.status_code)
+            log.debug("get_thread_messages body=%.4000s", r.text)   # C-2: body gated to DEBUG
             if r.status_code == 200:
                 body = r.json()
                 return body.get("messages", body) if isinstance(body, dict) else body
@@ -401,7 +453,8 @@ async def get_run_events(token: str, run_id: str):
     url = f"{WXO_BASE}/v1/orchestrate/runs/{run_id}/events"
     async with httpx.AsyncClient() as client:
         r = await client.get(url, headers=_headers(token), timeout=30)
-    log.info("get_run_events run_id=%s status=%s body=%s", run_id, r.status_code, r.text[:4000])
+    log.info("get_run_events run_id=%s status=%s", run_id, r.status_code)
+    log.debug("get_run_events body=%.4000s", r.text)   # C-2: body gated to DEBUG
     r.raise_for_status()
     body = r.json()
     return body.get("events", body) if isinstance(body, dict) else body
@@ -466,26 +519,28 @@ async def poll_wxo_run(token: str, run_id: str, thread_id: str | None = None) ->
     """
     url = f"{WXO_BASE}/v1/orchestrate/runs/{run_id}"
     deadline = time.time() + POLL_TIMEOUT
-    async with httpx.AsyncClient() as client:
-        while time.time() < deadline:
+    # H-4: create a fresh client per iteration — avoids idle connection expiry
+    # across the up-to-180 s poll window.
+    while time.time() < deadline:
+        async with httpx.AsyncClient() as client:
             r = await client.get(url, headers=_headers(token), timeout=30)
-            r.raise_for_status()
-            body = r.json()
-            status = body.get("status", "")
-            log.info("poll_wxo_run run_id=%s status=%s", run_id, status)
+        r.raise_for_status()
+        body = r.json()
+        status = body.get("status", "")
+        log.info("poll_wxo_run run_id=%s status=%s", run_id, status)
 
-            if status in ("completed", "async_completed"):
-                if thread_id:
-                    return await poll_thread_for_newsletter(token, thread_id)
-                return await get_run_events_text(token, run_id)
+        if status in ("completed", "async_completed"):
+            if thread_id:
+                return await poll_thread_for_newsletter(token, thread_id)
+            return await get_run_events_text(token, run_id)
 
-            if status in ("failed", "cancelled", "expired"):
-                raise RuntimeError(f"Run {run_id} ended with status '{status}'")
+        if status in ("failed", "cancelled", "expired"):
+            raise RuntimeError(f"Run {run_id} ended with status '{status}'")
 
-            if status == "requires_input":
-                raise RuntimeError(f"Run {run_id} requires additional input — not supported")
+        if status == "requires_input":
+            raise RuntimeError(f"Run {run_id} requires additional input — not supported")
 
-            await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
 
     raise TimeoutError(f"Timed out after {POLL_TIMEOUT}s waiting for run {run_id}")
 
@@ -600,11 +655,16 @@ def _is_header_leak(title: str, source: str, date: str, snippet: str) -> bool:
 
 
 def _normalize_article(article: dict) -> dict:
+    log.debug("_normalize_article keys=%s", list(article.keys()))
     return {
         "title": article.get("title") or article.get("headline") or article.get("name") or "Untitled article",
         "source": article.get("source") or article.get("publisher") or article.get("outlet") or "",
         "date": article.get("date") or article.get("published_at") or article.get("published") or "",
-        "snippet": article.get("snippet") or article.get("summary") or article.get("description") or "",
+        "snippet": (
+            article.get("snippet") or article.get("summary") or article.get("description")
+            or article.get("body") or article.get("content") or article.get("text")
+            or article.get("excerpt") or article.get("abstract") or ""
+        ),
         "relevance": str(article.get("relevance") or article.get("score") or "med").lower(),
         "url": article.get("url") or article.get("link") or "",
     }
@@ -692,6 +752,10 @@ def parse_fetch_result(raw_text: str) -> dict:
             news_content = news_content.get("articles") or []
         if isinstance(curated_articles, dict):
             curated_articles = curated_articles.get("articles") or []
+        if curated_articles:
+            log.info("parse_fetch_result: first curated article keys=%s sample=%s",
+                     list(curated_articles[0].keys()) if isinstance(curated_articles[0], dict) else "non-dict",
+                     str(curated_articles[0])[:300])
         return {
             "keyword_list": parsed.get("keyword_list") or [],
             "news_content": _normalize_and_filter(news_content),
@@ -849,6 +913,19 @@ class SendRequest(BaseModel):
     html_body: str
     text_body: str = ""
 
+    # H-2: validate addresses — reject malformed and newline-injected values
+    @field_validator("to")
+    @classmethod
+    def validate_addresses(cls, v):
+        if not v:
+            raise ValueError("at least one recipient required")
+        if len(v) > 50:
+            raise ValueError("too many recipients (max 50)")
+        for addr in v:
+            if not _EMAIL_RE.match(addr):
+                raise ValueError(f"invalid email address: {addr!r}")
+        return v
+
 
 @app.post("/send-newsletter")
 async def send_newsletter(req: SendRequest):
@@ -867,10 +944,17 @@ async def send_newsletter(req: SendRequest):
         msg.attach(MIMEText(req.text_body, "plain", "utf-8"))
     msg.attach(MIMEText(req.html_body, "html", "utf-8"))
 
-    try:
+    # C-3: SMTP_SSL is blocking I/O — run it in a thread pool so the event loop
+    # is not frozen for the duration of the SMTP handshake + send (up to 30 s).
+    msg_str = msg.as_string()
+
+    def _send_blocking():
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, req.to, msg.as_string())
+            server.sendmail(SMTP_FROM, req.to, msg_str)
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _send_blocking)
         log.info("send_newsletter: sent to %s", req.to)
         return {"sent_to": req.to}
     except smtplib.SMTPAuthenticationError:
@@ -886,10 +970,16 @@ async def pipeline_fetch(req: PipelineFetchRequest):
     try:
         token = await get_wxo_token()
 
-        topic_text = await run_wxo_agent(token, build_topic_prompt(ctx), agent_id=TOPIC_AGENT_ID)
-        keyword_list = _parse_keyword_list(topic_text)
-        if not keyword_list:
-            keyword_list = ctx.get("keywords") or [ctx.get("intent", "")]
+        # Skip keyword expansion when the caller already supplies a keyword list
+        # (e.g. user edited tags on stage 3 and clicked Re-fetch).
+        if ctx.get("keywords"):
+            keyword_list = ctx["keywords"]
+            log.info("pipeline/fetch: using provided keyword_list (%d terms), skipping topic agent", len(keyword_list))
+        else:
+            topic_text = await run_wxo_agent(token, build_topic_prompt(ctx), agent_id=TOPIC_AGENT_ID)
+            keyword_list = _parse_keyword_list(topic_text)
+            if not keyword_list:
+                keyword_list = [ctx.get("intent", "")]
 
         raw_news_text = await run_wxo_agent(token, build_fetch_agent_prompt(keyword_list, time_window), agent_id=FETCH_AGENT_ID)
         parsed_news = parse_fetch_result(raw_news_text)

@@ -349,7 +349,7 @@
     <div class="running-wrap">
       <div class="spinner"></div>
       <h1>Fetching articles…</h1>
-      <p class="lede" style="margin:0 auto var(--s32);text-align:center">The agent is expanding your keywords and searching for the most relevant recent articles.</p>
+      <p class="lede" id="fetchLede" style="margin:0 auto var(--s32);text-align:center">The agent is expanding your keywords and searching for the most relevant recent articles.</p>
 
       <div class="steps-list">
         <div class="step-item" id="fs1">
@@ -403,6 +403,7 @@
 
     <div class="btnbar split" style="margin-top:var(--s32)">
       <button class="btn ghost" id="btnBackToSetup">← Back to set up</button>
+      <button class="btn ghost" id="btnRefetch">↺ Re-fetch with these keywords</button>
       <button class="btn" id="btnGenerate" disabled>Generate newsletter <span style="font-size:16px">→</span></button>
     </div>
   </div>
@@ -547,7 +548,8 @@
 
 
 <script>
-  const PROXY = 'http://localhost:8080';
+  // H-5: derive origin from the page itself so HTTPS deployments don't break
+  const PROXY = window.location.origin;
 
   // ── Navigation ────────────────────────────────────────────────────────────────
   const STAGE_LABELS = {
@@ -694,12 +696,25 @@
 
   // ── Fetch-phase step animation (page 2) ───────────────────────────────────────
   let _fetchTimer = null;
-  function startFetchAnimation() {
+  function startFetchAnimation(skipStep1) {
     const steps = ['fs1', 'fs2', 'fs3'];
-    let i = 0;
     steps.forEach(id => document.getElementById(id).classList.remove('done', 'active'));
-    document.getElementById(steps[0]).classList.add('active');
     document.getElementById('fetchNote').textContent = 'Waiting for response…';
+
+    let i = 0;
+    if (skipStep1) {
+      // Mark step 1 as already done; start animation at step 2
+      document.getElementById('fs1').classList.add('done');
+      document.getElementById('fs1').querySelector('.sd').textContent = 'Using your selected keywords';
+      document.getElementById('fs2').classList.add('active');
+      document.getElementById('fetchLede').textContent = 'Fetching and curating articles for your selected keywords.';
+      i = 1;
+    } else {
+      document.getElementById('fs1').querySelector('.sd').textContent = 'Expanding your topic into search terms';
+      document.getElementById('fetchLede').textContent = 'The agent is expanding your keywords and searching for the most relevant recent articles.';
+      document.getElementById(steps[0]).classList.add('active');
+    }
+
     _fetchTimer = setInterval(() => {
       if (i < steps.length) {
         document.getElementById(steps[i]).classList.replace('active', 'done');
@@ -787,7 +802,8 @@
   function getSelectedArticles() {
     const selected = [];
     document.querySelectorAll('.article-card.sel').forEach(card => {
-      selected.push(_articles[+card.dataset.idx]);
+      const article = _articles[+card.dataset.idx];
+      if (article) selected.push(article);   // H-6: guard stale indices after re-fetch
     });
     return selected;
   }
@@ -1000,10 +1016,52 @@
     }
   });
 
+  // ── Re-fetch button (page 3 → 2 → 3) ────────────────────────────────────────
+  document.getElementById('btnRefetch').addEventListener('click', async () => {
+    // Read current live tags as the new keyword list
+    const updatedKeywords = Array.from(document.querySelectorAll('#kwTags .tag.sel'))
+                              .map(t => t.textContent.replace('×', '').trim());
+    if (!updatedKeywords.length) {
+      setStatus('status3', 'Add at least one keyword before re-fetching.', true);
+      return;
+    }
+
+    // Update ctx with the edited keywords; leave all other settings unchanged
+    window._pipelineCtx.keywords = updatedKeywords;
+
+    setStatus('status3', '');
+    goStage(2);
+    startFetchAnimation(true);  // skipStep1 — keywords already set by user
+
+    try {
+      const result = await callFetch(window._pipelineCtx);
+      stopFetchAnimation();
+      if (!result.curatedArticles.length) {
+        throw new Error('The backend returned no articles for these keywords.');
+      }
+      // Backend echoes back the keyword_list it used; sync tags to match
+      if (result.keywordList && result.keywordList.length) {
+        populateKeywordTags(result.keywordList);
+        window._pipelineCtx.keywords = result.keywordList;
+      }
+      renderArticles(result.curatedArticles);
+      setStatus('status3', '');
+      goStage(3);
+    } catch (e) {
+      stopFetchAnimation();
+      setStatus('status3', '⚠ ' + e.message, true);
+      goStage(3);
+    }
+  });
+
   // ── Generate button (page 3 → 4 → 5) ─────────────────────────────────────────
   document.getElementById('btnGenerate').addEventListener('click', async () => {
     const selected = getSelectedArticles();
     if (!selected.length) return;
+
+    // Sync keyword tags — user may have toggled/added tags since the fetch completed
+    window._pipelineCtx.keywords = Array.from(document.querySelectorAll('#kwTags .tag.sel'))
+                                      .map(t => t.textContent.replace('×', '').trim());
 
     goStage(4);
     startGenAnimation();
