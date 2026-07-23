@@ -723,7 +723,20 @@
     updateSelCount();
 
     articles.forEach((a, i) => {
-      const relevance = a.relevance || 'med';
+      // Normalise relevance to a tier string — the backend already does this,
+      // but guard here too in case a raw numeric score arrives through JSON.
+      const relevance = (function(raw) {
+        const s = String(raw || '').trim().toLowerCase();
+        if (s === 'high') return 'high';
+        if (s === 'low')  return 'low';
+        if (s === 'medium' || s === 'med' || s === 'moderate') return 'med';
+        const n = parseFloat(s);
+        if (!isNaN(n)) {
+          const pct = n <= 1 && s.includes('.') ? n * 100 : n;
+          return pct >= 70 ? 'high' : pct >= 40 ? 'med' : 'low';
+        }
+        return 'med';
+      })(a.relevance);
       const badgeClass = relevance === 'high' ? 'high' : relevance === 'low' ? 'low' : 'med';
       const badgeLabel = relevance === 'high' ? 'High relevance' : relevance === 'low' ? 'Low relevance' : 'Medium relevance';
 

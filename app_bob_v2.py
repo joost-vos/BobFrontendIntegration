@@ -654,6 +654,40 @@ def _is_header_leak(title: str, source: str, date: str, snippet: str) -> bool:
     return bool(values) and all(v in _HEADER_TOKENS for v in values)
 
 
+def _relevance_tier(raw) -> str:
+    """Normalise whatever the curation agent returns for relevance into one of
+    the three tier strings the frontend badge logic expects: 'high', 'med', 'low'.
+
+    The agent may return:
+      - A tier string already: 'high', 'medium', 'med', 'low'
+      - An integer 0-100:  85  → 'high',  55 → 'med',  30 → 'low'
+      - A float 0-1:       0.85 → 'high', 0.55 → 'med', 0.30 → 'low'
+      - A stringified number: '85', '0.85'
+    Thresholds: ≥70 → high, 40–69 → med, <40 → low (on a 0-100 scale).
+    """
+    if raw is None:
+        return "med"
+    s = str(raw).strip().lower()
+    if s in ("high",):
+        return "high"
+    if s in ("low",):
+        return "low"
+    if s in ("medium", "med", "moderate"):
+        return "med"
+    try:
+        val = float(s)
+        if val <= 1.0 and "." in s:   # treat as 0-1 probability
+            val *= 100
+        if val >= 70:
+            return "high"
+        if val >= 40:
+            return "med"
+        return "low"
+    except ValueError:
+        pass
+    return "med"
+
+
 def _normalize_article(article: dict) -> dict:
     log.debug("_normalize_article keys=%s", list(article.keys()))
     return {
@@ -665,7 +699,7 @@ def _normalize_article(article: dict) -> dict:
             or article.get("body") or article.get("content") or article.get("text")
             or article.get("excerpt") or article.get("abstract") or ""
         ),
-        "relevance": str(article.get("relevance") or article.get("score") or "med").lower(),
+        "relevance": _relevance_tier(article.get("relevance") or article.get("score")),
         "url": article.get("url") or article.get("link") or "",
     }
 
@@ -703,7 +737,7 @@ def _article_from_row(cells: list[str], column_map: list[str | None] | None) -> 
         "snippet": snippet,
         "source": values.get("source", ""),
         "url": values.get("url", ""),
-        "relevance": (values.get("relevance") or "med").lower(),
+        "relevance": _relevance_tier(values.get("relevance")),
     }
 
 
