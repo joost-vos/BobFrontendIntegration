@@ -193,6 +193,7 @@
   .nl-article p{font-size:13px;color:var(--gray-70);margin:0 0 var(--s8);line-height:1.6;}
   .nl-para{font-size:14px;color:#1f2328;line-height:1.75;margin:0 0 var(--s16);font-family:Georgia,'Times New Roman',serif;}
   .nl-para:last-child{margin-bottom:0;}
+  .nl-cite{font-size:11px;color:var(--blue-60);vertical-align:super;line-height:1;margin-left:1px;font-style:normal;}
   .nl-sources{margin-top:var(--s24);padding-top:var(--s16);border-top:1px solid var(--gray-20);}
   .nl-sources h5{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--gray-60);margin:0 0 var(--s8);}
   .nl-sources ol{margin:0;padding-left:var(--s16);}
@@ -854,6 +855,8 @@
       .replace(/\\n/g, '\n')
       // inline citations like [Source, 2024-07-15] or [1] or [Financial Times, 2026-07-15]
       .replace(/\[[^\]]{0,120}\]/g, '')
+      // parenthesised screenshot / figure labels e.g. (screenshot 1), (figure 2), (image 3)
+      .replace(/\(\s*(?:screenshot|figure|image|photo|fig\.?)\s*\d+\s*\)/gi, '')
       // bold/italic markdown: **text**, __text__, *text*, _text_
       .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
       .replace(/\*\*(.+?)\*\*/g, '$1')
@@ -878,10 +881,63 @@
       .trim();
   }
 
+  // ── Replace bare inline URLs with [N] citation markers ───────────────────────
+  // urlIndex: Map<url-string, 1-based-number> built from selectedArticles.
+  // Handles: plain https://..., (https://...), and "Source (https://...)" patterns.
+  // Returns the paragraph text with URLs replaced by superscript-style [N] markers.
+  // If a URL is not in the index (agent hallucinated a URL not in our list), it
+  // is simply removed rather than left as a raw URL.
+  function replaceCitationUrls(text, urlIndex) {
+    if (!urlIndex || urlIndex.size === 0) {
+      // No index — just strip all bare and parenthesised URLs
+      return text
+        .replace(/\(\s*https?:\/\/[^\s)]{1,500}\s*\)/g, '')
+        .replace(/https?:\/\/\S{1,500}/g, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+    }
+
+    // Replace "Word (https://url)" → "Word [N]"  (named-source pattern)
+    text = text.replace(
+      /(\S+)\s+\(\s*(https?:\/\/[^\s)]{1,500})\s*\)/g,
+      (match, word, url) => {
+        const n = urlIndex.get(url.trim());
+        return n !== undefined ? word + '\u202f[' + n + ']' : word;
+      }
+    );
+
+    // Replace remaining "(https://url)" → "[N]"  (bare parenthesised URL)
+    text = text.replace(
+      /\(\s*(https?:\/\/[^\s)]{1,500})\s*\)/g,
+      (match, url) => {
+        const n = urlIndex.get(url.trim());
+        return n !== undefined ? '\u202f[' + n + ']' : '';
+      }
+    );
+
+    // Replace any remaining bare "https://url" → "[N]"
+    text = text.replace(
+      /https?:\/\/\S{1,500}/g,
+      (url) => {
+        const n = urlIndex.get(url.trim().replace(/[.,;:!?)]+$/, ''));
+        return n !== undefined ? '\u202f[' + n + ']' : '';
+      }
+    );
+
+    return text.replace(/[ \t]{2,}/g, ' ').trim();
+  }
+
   // ── Populate review from agent prose ─────────────────────────────────────────
   // selectedArticles: array of article objects (title, source, url, date) from the
   //   selection stage — used to build the Sources section with real hyperlinks.
   function populateReview(rawText, ctx, selectedArticles) {
+    // Build a URL → 1-based index map from the articles that have URLs.
+    // This lets replaceCitationUrls() convert bare URLs to [N] markers that
+    // match the numbered Sources list rendered at the bottom.
+    const articlesWithUrl = (selectedArticles || []).filter(a => a && a.url);
+    const urlIndex = new Map();
+    articlesWithUrl.forEach((a, i) => urlIndex.set(a.url, i + 1));
+
     rawText = cleanLlmText(rawText);
 
     // Split into paragraphs; first non-empty line is the title
@@ -894,7 +950,8 @@
     document.getElementById('nlKicker').textContent = ctx.intent.toUpperCase() + ' DIGEST';
 
     // Render greeting (first body para) separately in the styled greeting element
-    document.getElementById('nlGreeting').textContent = bodyParas[0] || '';
+    document.getElementById('nlGreeting').textContent =
+      replaceCitationUrls(bodyParas[0] || '', urlIndex);
 
     // Remaining paragraphs rendered as clean readable prose blocks — no fake headlines
     const container = document.getElementById('nlArticles');
@@ -904,12 +961,11 @@
       p.className = 'nl-para';
       p.setAttribute('data-ed', '');
       p.setAttribute('contenteditable', 'false');
-      p.textContent = para;
+      p.textContent = replaceCitationUrls(para, urlIndex);
       container.appendChild(p);
     });
 
     // ── Sources section — one linked entry per selected article ─────────────────
-    const articlesWithUrl = (selectedArticles || []).filter(a => a && a.url);
     if (articlesWithUrl.length) {
       const section = document.createElement('div');
       section.className = 'nl-sources';
